@@ -1,0 +1,2 @@
+# auto_package_winrar
+用图形界面调用WinRAR进行多次打包
