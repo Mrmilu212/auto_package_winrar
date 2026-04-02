@@ -307,7 +307,7 @@ def _compute_base_prefix_for_input(input_path: Path) -> Path:
 
 def run_rar_archive(
     rar_exe: Path,
-    input_path: Path,
+    input_paths: list[Path],
     *,
     output_dir: Path | None = None,
     progress_cb: Callable[[int | None, float], None] | None = None,
@@ -315,24 +315,46 @@ def run_rar_archive(
     proc_cb: Callable[[subprocess.Popen[str] | None], None] | None = None,
 ) -> tuple[bool, Path | str]:
     """
-    Pack `input_path` into a .rar next to it.
-    - If input is a folder: archive the folder itself (top-level folder included).
-    - If input is a file: archive that file only.
+    Pack `input_paths` into a .rar.
+    - If only one path:
+      - folder: archive the folder itself (top-level folder included)
+      - file: archive that file only
+    - If multiple paths: pack all inputs into one archive and exclude paths (-ep),
+      so the archive contains each input's basename at top level.
     -r recurse; -idq quiet hash; -ibck background priority (optional).
     """
-    if not input_path.exists():
-        return False, f"路径不存在: {input_path}"
+    if not input_paths:
+        return False, "输入为空"
+    for p in input_paths:
+        if not p.exists():
+            return False, f"路径不存在: {p}"
 
-    out_dir = output_dir or input_path.parent
+    first_parent = input_paths[0].parent
+    out_dir = output_dir or first_parent
     out_rar = _pick_nonexistent_path(out_dir, ".rar")
 
-    if input_path.is_dir():
-        # 压缩“文件夹本身”，压缩包里顶层会包含该文件夹名
+    if len(input_paths) == 1:
+        input_path = input_paths[0]
+        if input_path.is_dir():
+            # 压缩“文件夹本身”，压缩包里顶层会包含该文件夹名
+            ok, msg = _rar_run(
+                rar_exe,
+                out_rar,
+                [input_path.name],
+                recurse=True,
+                cwd=input_path.parent,
+                progress_cb=progress_cb,
+                cancel_ev=cancel_ev,
+                proc_cb=proc_cb,
+            )
+            return (ok, out_rar) if ok else (False, msg)
+
+        # 单文件
         ok, msg = _rar_run(
             rar_exe,
             out_rar,
             [input_path.name],
-            recurse=True,
+            recurse=False,
             cwd=input_path.parent,
             progress_cb=progress_cb,
             cancel_ev=cancel_ev,
@@ -340,13 +362,15 @@ def run_rar_archive(
         )
         return (ok, out_rar) if ok else (False, msg)
 
-    # 单文件
+    # 多输入：用绝对路径 + -ep（排除路径），保证不同目录来源也能合并到同一压缩包
+    recurse = any(p.is_dir() for p in input_paths)
     ok, msg = _rar_run(
         rar_exe,
         out_rar,
-        [input_path.name],
-        recurse=False,
-        cwd=input_path.parent,
+        [str(p) for p in input_paths],
+        recurse=recurse,
+        exclude_paths=True,
+        cwd=None,
         progress_cb=progress_cb,
         cancel_ev=cancel_ev,
         proc_cb=proc_cb,
@@ -356,7 +380,7 @@ def run_rar_archive(
 
 def run_double_compress(
     rar_exe: Path,
-    input_path: Path,
+    input_paths: list[Path],
     *,
     output_dir: Path | None = None,
     progress_cb: Callable[[int | None, float], None] | None = None,
@@ -370,15 +394,19 @@ def run_double_compress(
     第二次：对伪装文件再打包 -> base.rar。
     成功后删除中间伪装文件。返回 (ok, message, detail_for_log)。
     """
-    if not input_path.exists():
-        return False, f"路径不存在: {input_path}", None
+    if not input_paths:
+        return False, "输入为空", None
+    for p in input_paths:
+        if not p.exists():
+            return False, f"路径不存在: {p}", None
 
-    out_dir = output_dir or input_path.parent
+    first_parent = input_paths[0].parent
+    out_dir = output_dir or first_parent
     if phase_cb:
         phase_cb(1, 2)
     ok1, out_or_err = run_rar_archive(
         rar_exe,
-        input_path,
+        input_paths,
         output_dir=out_dir,
         progress_cb=progress_cb,
         cancel_ev=cancel_ev,
@@ -440,37 +468,41 @@ def run_double_compress(
     return True, str(out_rar_2), detail
 
 
-def _compute_volume_spec(input_file_size_bytes: int) -> tuple[str, int]:
+def _compute_volume_spec(input_file_size_bytes: int) -> tuple[str, int, str | None]:
     """
     分卷规则：
-    - 至少 2 卷
-    - 每卷最大 2GB
-    返回 (WinRAR 的 -v 参数, 预计卷数下限)。
+    - 至少分 2 卷
+    - 单卷目标大小 = 总体积 / 2 + 1MB
+    - 单卷最大 = 2048MB + 1MB（即 2049MB）
+    - 如果按照上述规则仍不足以形成至少 2 卷，则返回提示并取消
+
+    返回 (WinRAR 的 -v 参数, 预计卷数下限, 取消原因提示或 None)。
     """
-    max_per_vol = 2 * 1024 * 1024 * 1024  # 2GB
+    one_mib = 1024 * 1024
+    max_per_vol_mb = 2048 + 1  # 2049MB
+    max_per_vol_bytes = max_per_vol_mb * one_mib
+
     if input_file_size_bytes <= 0:
-        # 保底：给一个很小的分卷值，仍然会分至少 2 卷
-        return "-v1m", 2
+        return "-v1m", 1, "文件大小无效，无法计算分卷"
 
-    if input_file_size_bytes <= max_per_vol:
-        # 强制至少 2 卷：每卷大小 = ceil(size/2)
-        per_vol_bytes = math.ceil(input_file_size_bytes / 2)
-    else:
-        # 文件较大：每卷最大 2GB（WinRAR 会自动生成多卷，卷数 >= ceil(size/2GB)）
-        per_vol_bytes = max_per_vol
+    # 目标：总体积/2 + 1MB（先做向上取整，避免因为取整导致更少卷）
+    target_per_vol_bytes = math.ceil(input_file_size_bytes / 2) + one_mib
+    per_vol_bytes = min(target_per_vol_bytes, max_per_vol_bytes)
+    per_vol_mb = max(1, math.ceil(per_vol_bytes / one_mib))
 
-    per_vol_mb = max(1, math.ceil(per_vol_bytes / (1024 * 1024)))
-    # 2GB = 2048MB；强制上限
-    per_vol_mb = min(per_vol_mb, 2048)
+    est_parts = max(1, math.ceil(input_file_size_bytes / (per_vol_mb * one_mib)))
+    if est_parts < 2:
+        # 规则 4：文件过小不足以分卷 -> 给提示并取消
+        return f"-v{per_vol_mb}m", est_parts, (
+            f"文件过小，无法分卷（目标单卷大小约 {per_vol_mb}MB，但预计仅 {est_parts} 卷）。"
+        )
 
-    # 预计卷数（下限）
-    est_parts = max(2, math.ceil(input_file_size_bytes / (per_vol_mb * 1024 * 1024)))
-    return f"-v{per_vol_mb}m", est_parts
+    return f"-v{per_vol_mb}m", est_parts, None
 
 
 def run_triple_compress(
     rar_exe: Path,
-    input_path: Path,
+    input_paths: list[Path],
     *,
     output_dir: Path | None = None,
     progress_cb: Callable[[int | None, float], None] | None = None,
@@ -486,18 +518,22 @@ def run_triple_compress(
 
     成功后删除中间伪装文件；最终产物为分卷：out_rar.part1.rar、out_rar.part2.rar...
     """
-    if not input_path.exists():
-        return False, f"路径不存在: {input_path}", None
+    if not input_paths:
+        return False, "输入为空", None
+    for p in input_paths:
+        if not p.exists():
+            return False, f"路径不存在: {p}", None
 
     # 先做二次压缩，得到 out_rar
-    out_dir = output_dir or input_path.parent
+    first_parent = input_paths[0].parent
+    out_dir = output_dir or first_parent
     def phase_2_to_3(step: int, _total: int) -> None:
         if phase_cb:
             phase_cb(step, 3)
 
     ok2, msg2, extra2 = run_double_compress(
         rar_exe,
-        input_path,
+        input_paths,
         output_dir=out_dir,
         progress_cb=progress_cb,
         phase_cb=phase_2_to_3 if phase_cb else None,
@@ -514,7 +550,9 @@ def run_triple_compress(
     except OSError as e:
         return False, f"读取二次压缩文件大小失败: {e}", None
 
-    vol_spec, est_parts = _compute_volume_spec(size)
+    vol_spec, est_parts, cancel_hint = _compute_volume_spec(size)
+    if cancel_hint is not None:
+        return False, cancel_hint, None
 
     # 第三次：把 out_rar 伪装为普通后缀，再分卷打包回 out_rar（会生成 part*.rar）
     disguised2: Path | None = None
@@ -567,7 +605,7 @@ def run_triple_compress(
         pass
 
     detail = (
-        f"三次压缩完成（分卷）。预计至少 {est_parts} 卷，单卷参数 {vol_spec}。"
+        f"三次压缩完成（分卷）。目标单卷≈总/2+1MB，最大≤2049MB。预计至少 {est_parts} 卷，WinRAR 参数 {vol_spec}。"
         f" 输出示例: {out_rar_3.with_suffix('')}.part1.rar"
     )
     return True, f"{out_rar_3.with_suffix('')}.part*.rar", detail
@@ -633,7 +671,7 @@ class App(tk.Tk):
 
         self.chk_double = tk.Checkbutton(
             frm_top,
-            text="二次压缩：先将首包改为随机伪装后缀（如 .png / .dll），再打包为最终 .rar（支持文件/文件夹）",
+            text="二次伪装后缀压缩",
             variable=self._var_double,
             justify=tk.LEFT,
             wraplength=520,
@@ -643,7 +681,7 @@ class App(tk.Tk):
 
         self.chk_triple = tk.Checkbutton(
             frm_top,
-            text="三次压缩（分卷）：在二次压缩基础上再打包一次，并按 2GB/卷 分卷（至少 2 卷）（支持文件/文件夹）",
+            text="三次分卷压缩",
             variable=self._var_triple,
             justify=tk.LEFT,
             wraplength=520,
@@ -686,7 +724,7 @@ class App(tk.Tk):
         self._log_line(
             "就绪。默认：每进行一次压缩都会生成 5 位随机文件名（英文大小写+数字）的 .rar。"
             " 二次：在第一次产物基础上改伪装后缀再打包，外层 .rar 也会是新的随机名。"
-            " 三次（分卷）：在二次基础上再打包一次并按 2GB/卷 分卷，输出为「随机名.part1.rar」等。"
+            " 三次（分卷）：单卷目标≈总/2+1MB，最大≤2049MB，至少 2 卷；过小将取消。"
         )
         self._set_status(0.0)
 
@@ -800,9 +838,7 @@ class App(tk.Tk):
         if not items:
             messagebox.showinfo("提示", "请拖放文件或文件夹。")
             return
-
-        for item in items:
-            self._start_pack(item)
+        self._start_pack(items)
 
     def _pick_folder(self) -> None:
         d = filedialog.askdirectory(title="选择要打包的文件夹")
@@ -810,10 +846,13 @@ class App(tk.Tk):
             return
         self._on_drop_files([os.fsencode(d)])
 
-    def _start_pack(self, item: Path) -> None:
+    def _start_pack(self, items: list[Path]) -> None:
         self._busy = True
         self.lbl_drop.configure(text="正在打包…")
-        self._log_line(f"开始: {item}")
+        if len(items) == 1:
+            self._log_line(f"开始: {items[0]}")
+        else:
+            self._log_line(f"开始: {items[0]}（共 {len(items)} 个输入）")
         # 状态栏阶段文案（不显示百分比/剩余时间）
         if self._var_triple.get():
             self._set_phase(1, 3)
@@ -829,7 +868,7 @@ class App(tk.Tk):
 
         def work() -> None:
             assert self._rar is not None
-            target_dir = item.parent
+            target_dir = items[0].parent
             temp_dir = target_dir / f".apwr_tmp_{_random_token(10)}"
             try:
                 temp_dir.mkdir(parents=False, exist_ok=False)
@@ -859,7 +898,7 @@ class App(tk.Tk):
                     # 三次：最终为分卷
                     ok_t, pattern_or_err, extra = run_triple_compress(
                         self._rar,
-                        item,
+                            items,
                         output_dir=temp_dir,
                         progress_cb=progress_cb,
                         phase_cb=phase_cb,
@@ -883,7 +922,7 @@ class App(tk.Tk):
                 elif self._var_double.get():
                     ok_d, out_path_or_err, extra = run_double_compress(
                         self._rar,
-                        item,
+                        items,
                         output_dir=temp_dir,
                         progress_cb=progress_cb,
                         phase_cb=phase_cb,
@@ -899,7 +938,7 @@ class App(tk.Tk):
                     phase_cb(1, 1)
                     ok_o, out_or_err = run_rar_archive(
                         self._rar,
-                        item,
+                        items,
                         output_dir=temp_dir,
                         progress_cb=progress_cb,
                         cancel_ev=self._cancel_ev,
