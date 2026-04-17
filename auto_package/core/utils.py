@@ -135,12 +135,28 @@ def _commit_outputs_atomic(
     import shutil
     moved: list[Path] = []
     try:
-        # 生成随机文件夹名
-        for _ in range(200):
-            folder_name = _random_archive_stem(5)
-            output_folder = target_dir / folder_name
+        # 生成文件夹名
+        # 对于分卷压缩，使用分卷文件的随机名作为文件夹名
+        # 对于普通压缩，使用随机生成的名称
+        if is_volumes and temp_outputs:
+            # 从分卷文件中提取随机名（去掉 .part*.rar 后缀）
+            import re
+            part_pattern = r'\.part\d+\.rar$'
+            first_file = temp_outputs[0].name
+            folder_name = re.sub(part_pattern, '', first_file)
+        else:
+            # 普通压缩，生成随机文件夹名
+            for _ in range(200):
+                folder_name = _random_archive_stem(5)
+                break
+        
+        # 确保文件夹名不冲突
+        output_folder = target_dir / folder_name
+        for i in range(200):
             if not output_folder.exists():
                 break
+            # 如果冲突，添加数字后缀
+            output_folder = target_dir / f"{folder_name}_{i+1}"
         else:
             return False, "无法生成不冲突的文件夹名称", []
 
