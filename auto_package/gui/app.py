@@ -571,12 +571,10 @@ class App(tk.Tk):
 
         if ok:
             self._log_line(f"解压成功: {msg}")
-            messagebox.showinfo("成功", msg)
         else:
             self._log_line(f"解压失败: {msg}")
             if extra:
                 self._log_line(f"中间文件: {extra}")
-            messagebox.showerror("失败", msg)
 
         if self._close_after_cancel:
             self.destroy()
