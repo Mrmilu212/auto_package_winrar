@@ -30,8 +30,8 @@ _FAKE_EXTS = (
     ".csv",
 )
 
-# 可执行文件后缀（只检查 .exe）
-_EXECUTABLE_EXTS = {'.exe'}
+# 可执行文件后缀（检查 .exe 和 .apk）
+_EXECUTABLE_EXTS = {'.exe', '.apk'}
 
 # 支持的压缩包后缀（用于识别已知压缩格式，伪装文件只尝试zip格式）
 _ARCHIVE_EXTS = ['.rar', '.7z', '.zip']
