@@ -3,13 +3,18 @@ import time
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import ttk
 from pathlib import Path
 from typing import Iterable
 import subprocess
 from auto_package.core.compress import find_rar_exe, run_rar_archive, run_double_compress, run_triple_compress
 from auto_package.core.extract import find_winrar_exe, run_auto_extract
 from auto_package.core.utils import decode_drop_path, _commit_outputs_atomic
-from auto_package.config.settings import _load_window_geometry, _save_window_geometry
+from auto_package.config.settings import _load_window_geometry, _save_window_geometry, _load_upload_paths, _save_upload_paths
+from auto_package.gui.pages.home import Home
+from auto_package.gui.pages.transfer import Transfer
+from auto_package.gui.pages.upload_path import UploadPath
+from auto_package.utils.logging_config import setup_logging, get_logger
 
 try:
     import windnd
@@ -19,6 +24,11 @@ except ImportError:
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        
+        # 初始化日志
+        self.logger = setup_logging()
+        self.logger.info('程序启动')
+        
         self.title("拖放文件夹 — WinRAR 打包")
         self.minsize(480, 320)
         
@@ -51,13 +61,33 @@ class App(tk.Tk):
         self._upload_thread_count = 0
         self._max_upload_threads = 5
         
-        # 上传进程管理
-        self._upload_processes = []  # 存储上传进程信息
-        self._upload_process_id = 0
-        self._transfer_timer_id = None  # 传输窗口定时器ID
+        # 百度网盘上传选项
+        self._var_upload = tk.BooleanVar(value=False)
+        
+        # 上传路径配置
+        self._upload_path, self._upload_path_history = _load_upload_paths()
 
-        self._build_ui()
-        self._hook_drop()
+        # 标签页管理
+        self._notebook = ttk.Notebook(self)
+        self._notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # 主页标签
+        self._home_frame = tk.Frame(self._notebook)
+        self._notebook.add(self._home_frame, text="主页")
+        
+        # 传输标签
+        self._transfer_frame = tk.Frame(self._notebook)
+        self._notebook.add(self._transfer_frame, text="传输")
+        
+        # 上传路径管理标签
+        self._upload_path_frame = tk.Frame(self._notebook)
+        self._notebook.add(self._upload_path_frame, text="上传路径")
+        
+        # 初始化页面
+        self._home_page = Home(self._home_frame, self)
+        self._transfer_page = Transfer(self._transfer_frame, self)
+        self._upload_path_page = UploadPath(self._upload_path_frame, self)
+        
         self._wire_mode_vars()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -73,169 +103,7 @@ class App(tk.Tk):
         self._var_triple.trace_add("write", on_triple_changed)
         self._var_double.trace_add("write", on_double_changed)
 
-    def _build_ui(self) -> None:
-        pad = {"padx": 12, "pady": 8}
 
-        # 窗口切换按钮
-        self._current_window = "main"
-        self._main_frame = None
-        self._transfer_frame = None
-        
-        # 切换按钮框架
-        switch_frame = tk.Frame(self)
-        switch_frame.pack(fill=tk.X, padx=12, pady=8)
-        
-        self.btn_main = tk.Button(switch_frame, text="主界面", command=lambda: self._switch_window("main"))
-        self.btn_main.pack(side=tk.LEFT, padx=4)
-        
-        self.btn_transfer = tk.Button(switch_frame, text="传输窗口", command=lambda: self._switch_window("transfer"))
-        self.btn_transfer.pack(side=tk.LEFT, padx=4)
-
-        # 主界面框架
-        self._main_frame = tk.Frame(self)
-        
-        if self._rar:
-            rar_line = f"已找到: {self._rar}"
-        else:
-            rar_line = "未找到 WinRAR（Rar.exe）。请安装 WinRAR 或检查安装路径。"
-
-        frm_top = tk.Frame(self._main_frame)
-        frm_top.pack(fill=tk.X, **pad)
-
-        self.lbl_hint = tk.Label(
-            frm_top,
-            text="将文件/文件夹拖放到下方区域，或点击「选择文件夹」",
-            justify=tk.LEFT,
-            wraplength=520,
-        )
-        self.lbl_hint.pack(anchor=tk.W)
-
-        self.lbl_rar = tk.Label(frm_top, text=rar_line, fg="#333", justify=tk.LEFT)
-        self.lbl_rar.pack(anchor=tk.W, pady=(4, 0))
-
-        self.chk_double = tk.Checkbutton(
-            frm_top,
-            text="二次伪装后缀压缩",
-            variable=self._var_double,
-            justify=tk.LEFT,
-            wraplength=520,
-            anchor=tk.W,
-        )
-        self.chk_double.pack(anchor=tk.W, pady=(6, 0))
-
-        self.chk_triple = tk.Checkbutton(
-            frm_top,
-            text="三次分卷压缩",
-            variable=self._var_triple,
-            justify=tk.LEFT,
-            wraplength=520,
-            anchor=tk.W,
-        )
-        self.chk_triple.pack(anchor=tk.W, pady=(2, 0))
-
-        # 百度网盘上传选项
-        self._var_upload = tk.BooleanVar(value=False)
-        self.chk_upload = tk.Checkbutton(
-            frm_top,
-            text="上传到百度网盘",
-            variable=self._var_upload,
-            justify=tk.LEFT,
-            wraplength=520,
-            anchor=tk.W,
-        )
-        self.chk_upload.pack(anchor=tk.W, pady=(6, 0))
-
-        # 拖放区域容器
-        drop_container = tk.Frame(self._main_frame)
-        drop_container.pack(fill=tk.BOTH, expand=True, **pad)
-
-        # 压缩拖放区域
-        compress_frame = tk.Frame(drop_container)
-        compress_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
-        tk.Label(compress_frame, text="压缩拖放区", font=("Segoe UI", 10, "bold"), fg="#666").pack(anchor=tk.W, pady=(0, 4))
-        self.drop_frame = tk.Frame(compress_frame, relief=tk.SUNKEN, bd=2, bg="#e8eef5", width=250, height=250)
-        self.drop_frame.pack(fill=tk.BOTH, expand=True)
-        self.drop_frame.pack_propagate(False)
-
-        self.lbl_drop = tk.Label(
-            self.drop_frame,
-            text="拖放文件/文件夹",
-            bg="#e8eef5",
-            fg="#456",
-            font=("Segoe UI", 12),
-        )
-        self.lbl_drop.pack(expand=True)
-
-        # 解压拖放区域
-        extract_frame = tk.Frame(drop_container)
-        extract_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 0))
-        tk.Label(extract_frame, text="解压拖放区", font=("Segoe UI", 10, "bold"), fg="#666").pack(anchor=tk.W, pady=(0, 4))
-        self.extract_drop_frame = tk.Frame(extract_frame, relief=tk.SUNKEN, bd=2, bg="#f5e8ee", width=250, height=250)
-        self.extract_drop_frame.pack(fill=tk.BOTH, expand=True)
-        self.extract_drop_frame.pack_propagate(False)
-
-        self.lbl_extract_drop = tk.Label(
-            self.extract_drop_frame,
-            text="拖放要解压的文件",
-            bg="#f5e8ee",
-            fg="#644",
-            font=("Segoe UI", 12),
-        )
-        self.lbl_extract_drop.pack(expand=True)
-
-        btn_row = tk.Frame(self._main_frame)
-        btn_row.pack(fill=tk.X, **pad)
-
-        tk.Button(btn_row, text="选择文件夹…", command=self._pick_folder).pack(
-            side=tk.LEFT
-        )
-        tk.Button(btn_row, text="清空日志", command=self._clear_log).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-        
-        # 按钮容器
-        btn_right = tk.Frame(btn_row)
-        btn_right.pack(side=tk.RIGHT)
-        
-        self.btn_cancel = tk.Button(
-            btn_right, text="取消压缩", command=self._cancel_current, state=tk.DISABLED
-        )
-        self.btn_cancel.pack(side=tk.LEFT, padx=(0, 8))
-        
-        self.btn_cancel_extract = tk.Button(
-            btn_right, text="取消解压", command=self._cancel_extract, state=tk.DISABLED
-        )
-        self.btn_cancel_extract.pack(side=tk.LEFT)
-
-        self.log = scrolledtext.ScrolledText(self._main_frame, height=8, state=tk.DISABLED)
-        self.log.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
-
-        self.status = tk.Label(self._main_frame, textvariable=self._status_var, anchor=tk.W)
-        self.status.pack(fill=tk.X, padx=12, pady=(0, 10))
-        
-        # 传输窗口框架
-        self._transfer_frame = tk.Frame(self)
-        
-        # 传输窗口标题
-        transfer_title = tk.Label(self._transfer_frame, text="上传进程", font=("Segoe UI", 12, "bold"))
-        transfer_title.pack(padx=12, pady=8, anchor=tk.W)
-        
-        # 传输列表
-        self._transfer_list_frame = tk.Frame(self._transfer_frame)
-        self._transfer_list_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
-        
-        # 初始显示
-        self._main_frame.pack(fill=tk.BOTH, expand=True)
-        self._transfer_frame.pack(fill=tk.BOTH, expand=True)
-        self._transfer_frame.pack_forget()  # 初始隐藏传输窗口
-
-        self._log_line(
-            "就绪。默认：每进行一次压缩都会生成 5 位随机文件名（英文大小写+数字）的 .rar。"
-            " 二次：在第一次产物基础上改伪装后缀再打包，外层 .rar 也会是新的随机名。"
-            " 三次（分卷）：单卷目标≈总/2+10MB，最大≤2049MB，至少 2 卷；过小将取消。"
-        )
-        self._log_line("解压：拖放文件到右侧区域，自动识别并解压，支持去伪装。")
-        self._set_status(0.0)
 
     def _fmt_time(self, seconds: float) -> str:
         seconds = max(0.0, float(seconds))
@@ -258,149 +126,10 @@ class App(tk.Tk):
             if total <= 1:
                 self._phase_text = "正在压缩" if self._busy else "就绪"
                 return
-    
-    def _switch_window(self, window_name: str) -> None:
-        """切换窗口"""
-        if self._current_window == window_name:
-            return
-        
-        # 隐藏当前窗口
-        if self._current_window == "main":
-            self._main_frame.pack_forget()
-        else:
-            self._transfer_frame.pack_forget()
-            # 停止定时器
-            if self._transfer_timer_id:
-                self.after_cancel(self._transfer_timer_id)
-                self._transfer_timer_id = None
-        
-        # 显示目标窗口
-        if window_name == "main":
-            self._main_frame.pack(fill=tk.BOTH, expand=True)
-        else:
-            self._transfer_frame.pack(fill=tk.BOTH, expand=True)
-            # 刷新传输窗口
-            self._update_transfer_window()
-            # 启动定时器，每秒刷新一次
-            self._start_transfer_timer()
-        
-        self._current_window = window_name
-    
-    def _update_transfer_window(self) -> None:
-        """更新传输窗口"""
-        # 清空传输列表
-        for widget in self._transfer_list_frame.winfo_children():
-            widget.destroy()
-        
-        # 添加标题行
-        title_frame = tk.Frame(self._transfer_list_frame)
-        title_frame.pack(fill=tk.X, pady=2)
-        tk.Label(title_frame, text="文件名", width=40, anchor=tk.W, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
-        tk.Label(title_frame, text="已用时间", width=15, anchor=tk.E, font=("Segoe UI", 10, "bold")).pack(side=tk.RIGHT)
-        
-        # 添加分割线
-        tk.Frame(self._transfer_list_frame, height=2, bg="#ccc").pack(fill=tk.X, pady=2)
-        
-        # 显示上传进程
-        if not self._upload_processes:
-            empty_label = tk.Label(self._transfer_list_frame, text="暂无上传进程", fg="#666")
-            empty_label.pack(pady=20)
-        else:
-            for proc in self._upload_processes:
-                proc_frame = tk.Frame(self._transfer_list_frame, bg="#f5f5f5")
-                proc_frame.pack(fill=tk.X, pady=2, padx=2)
-                
-                # 文件名
-                file_name = proc.get("file_name", "未知文件")
-                tk.Label(proc_frame, text=file_name, width=40, anchor=tk.W, bg="#f5f5f5").pack(side=tk.LEFT)
-                
-                # 已用时间（中间位置）
-                elapsed = time.time() - proc.get("start_time", time.time())
-                time_str = self._fmt_time(elapsed)
-                time_frame = tk.Frame(proc_frame, bg="#f5f5f5")
-                time_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-                tk.Label(time_frame, text=time_str, width=15, anchor=tk.CENTER, bg="#f5f5f5").pack(side=tk.LEFT)
-                
-                # 取消按钮（最右边）
-                cancel_btn = tk.Button(proc_frame, text="取消", width=6, command=lambda pid=proc["id"]: self._cancel_upload_process(pid))
-                cancel_btn.pack(side=tk.RIGHT, padx=5)
-    
-    def _add_upload_process(self, file_name: str) -> int:
-        """添加上传进程"""
-        proc_id = self._upload_process_id
-        self._upload_process_id += 1
-        
-        proc_info = {
-            "id": proc_id,
-            "file_name": file_name,
-            "start_time": time.time(),
-            "cancel_ev": threading.Event(),
-            "proc": None
-        }
-        self._upload_processes.append(proc_info)
-        return proc_id
-    
-    def _remove_upload_process(self, proc_id: int) -> None:
-        """移除上传进程"""
-        self._upload_processes = [p for p in self._upload_processes if p["id"] != proc_id]
-        # 刷新传输窗口
-        if self._current_window == "transfer":
-            self.after(0, self._update_transfer_window)
-    
-    def _start_transfer_timer(self) -> None:
-        """启动传输窗口定时器"""
-        def update():
-            self._update_transfer_window()
-            self._transfer_timer_id = self.after(1000, update)  # 每秒刷新一次
-        
-        # 先停止之前的定时器
-        if self._transfer_timer_id:
-            self.after_cancel(self._transfer_timer_id)
-        
-        # 启动新的定时器
-        self._transfer_timer_id = self.after(1000, update)
-    
-    def _cancel_upload_process(self, proc_id: int) -> None:
-        """取消上传进程"""
-        # 找到对应的上传进程
-        proc_info = None
-        for p in self._upload_processes:
-            if p["id"] == proc_id:
-                proc_info = p
-                break
-        
-        if not proc_info:
-            return
-        
-        # 设置取消事件
-        cancel_ev = proc_info.get("cancel_ev")
-        if cancel_ev:
-            cancel_ev.set()
-        
-        # 终止进程（如果存在）
-        proc = proc_info.get("proc")
-        if proc:
-            try:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            except Exception as e:
-                self._log_line(f"终止上传进程失败: {e}")
-        
-        # 从上传进程列表中移除
-        self._upload_processes = [p for p in self._upload_processes if p["id"] != proc_id]
-        
-        # 减少上传线程计数
-        self._upload_thread_count = max(0, self._upload_thread_count - 1)
-        
-        # 刷新传输窗口
-        if self._current_window == "transfer":
-            self._update_transfer_window()
-        
-        # 记录日志
-        self._log_line(f"上传进程已取消: {proc_info.get('file_name', '未知文件')}")
+            if step is None:
+                self._phase_text = "正在压缩" if self._busy else "就绪"
+                return
+            self._phase_text = f"正在进行第{step}次压缩"
 
     def _set_status(self, elapsed: float) -> None:
         self._status_var.set(f"{self._phase_text}    已用: {self._fmt_time(elapsed)}")
@@ -470,12 +199,14 @@ class App(tk.Tk):
             self._cancel_current()
             # 等任务结束后在 done() 里关闭
             self._log_line("正在取消并退出…")
+            self.logger.info('正在取消压缩操作并退出')
             return
         if self._extract_busy:
             self._close_after_cancel = True
             self._cancel_extract()
             # 等任务结束后在 extract_done() 里关闭
             self._log_line("正在取消解压并退出…")
+            self.logger.info('正在取消解压操作并退出')
             return
         # 保存窗口大小
         try:
@@ -483,43 +214,65 @@ class App(tk.Tk):
             height = self.winfo_height()
             if width > 0 and height > 0:
                 _save_window_geometry(width, height)
-        except Exception:
+                self.logger.debug('保存窗口大小: %dx%d', width, height)
+        except Exception as e:
+            self.logger.debug('保存窗口大小失败: %s', e)
             pass
+        self.logger.info('程序退出')
         self.destroy()
 
     def _hook_drop(self) -> None:
         if windnd is None:
             self._log_line("未安装 windnd，拖放不可用。请运行: pip install -r requirements.txt")
+            self.logger.warning('未安装 windnd，拖放不可用')
             return
         try:
             # 压缩拖放区域
             kw = {"func": self._on_drop_files, "force_unicode": True}
-            windnd.hook_dropfiles(self.drop_frame, **kw)
-            windnd.hook_dropfiles(self.lbl_drop, **kw)
+            windnd.hook_dropfiles(self._home_page.drop_frame, **kw)
+            windnd.hook_dropfiles(self._home_page.lbl_drop, **kw)
             # 解压拖放区域
             kw_extract = {"func": self._on_drop_extract, "force_unicode": True}
-            windnd.hook_dropfiles(self.extract_drop_frame, **kw_extract)
-            windnd.hook_dropfiles(self.lbl_extract_drop, **kw_extract)
+            windnd.hook_dropfiles(self._home_page.extract_drop_frame, **kw_extract)
+            windnd.hook_dropfiles(self._home_page.lbl_extract_drop, **kw_extract)
+            self.logger.debug('拖放注册成功')
         except Exception as e:
             self._log_line(f"拖放注册失败: {e}")
+            self.logger.warning('拖放注册失败: %s', e)
 
     def _clear_log(self) -> None:
-        self.log.configure(state=tk.NORMAL)
-        self.log.delete("1.0", tk.END)
-        self.log.configure(state=tk.DISABLED)
+        self._home_page.log.configure(state=tk.NORMAL)
+        self._home_page.log.delete("1.0", tk.END)
+        self._home_page.log.configure(state=tk.DISABLED)
+    
+    def _open_log_folder(self) -> None:
+        """打开日志文件夹"""
+        import os
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        log_dir = os.path.join(project_root, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            os.startfile(log_dir)
+            self.logger.debug('打开日志文件夹: %s', log_dir)
+        except Exception as e:
+            self._log_line(f"打开日志文件夹失败: {e}")
+            self.logger.error('打开日志文件夹失败: %s', e)
 
     def _log_line(self, msg: str) -> None:
-        self.log.configure(state=tk.NORMAL)
-        self.log.insert(tk.END, msg + "\n")
-        self.log.see(tk.END)
-        self.log.configure(state=tk.DISABLED)
+        if hasattr(self, '_home_page') and hasattr(self._home_page, 'log'):
+            self._home_page.log.configure(state=tk.NORMAL)
+            self._home_page.log.insert(tk.END, msg + "\n")
+            self._home_page.log.see(tk.END)
+            self._home_page.log.configure(state=tk.DISABLED)
 
     def _on_drop_files(self, paths: Iterable[bytes]) -> None:
         if self._busy:
             self._log_line("正在打包，请稍候…")
+            self.logger.debug('用户尝试拖放文件，但当前正在打包')
             return
         if not self._rar:
             messagebox.showerror("WinRAR", "未找到 Rar.exe，无法打包。")
+            self.logger.error('未找到 Rar.exe，无法打包')
             return
 
         decoded = [
@@ -528,22 +281,34 @@ class App(tk.Tk):
         items = [Path(p) for p in decoded if Path(p).exists()]
         if not items:
             messagebox.showinfo("提示", "请拖放文件或文件夹。")
+            self.logger.debug('用户拖放了不存在的文件')
             return
+        file_paths = [str(item) for item in items]
+        self.logger.info('用户拖放文件: %s', ', '.join(file_paths))
         self._start_pack(items)
 
     def _pick_folder(self) -> None:
         d = filedialog.askdirectory(title="选择要打包的文件夹")
         if not d:
+            self.logger.debug('用户取消选择文件夹')
             return
+        self.logger.info('用户选择文件夹: %s', d)
         self._on_drop_files([os.fsencode(d)])
 
     def _start_pack(self, items: list[Path]) -> None:
         self._busy = True
-        self.lbl_drop.configure(text="正在打包…")
+        self._home_page.lbl_drop.configure(text="正在打包…")
         if len(items) == 1:
             self._log_line(f"开始: {items[0]}")
+            self.logger.info('开始压缩: %s', items[0])
         else:
             self._log_line(f"开始: {items[0]}（共 {len(items)} 个输入）")
+            self.logger.info('开始压缩: %s（共 %d 个输入）', items[0], len(items))
+        
+        # 记录压缩参数
+        compress_mode = '三次压缩' if self._var_triple.get() else '二次压缩' if self._var_double.get() else '一次压缩'
+        self.logger.debug('压缩模式: %s', compress_mode)
+        
         # 状态栏阶段文案（不显示百分比/剩余时间）
         if self._var_triple.get():
             self._set_phase(1, 3)
@@ -552,7 +317,7 @@ class App(tk.Tk):
         else:
             self._set_phase(None, 1)
         self._start_job_timer()
-        self.btn_cancel.configure(state=tk.NORMAL)
+        self._home_page.btn_cancel.configure(state=tk.NORMAL)
         self._close_after_cancel = False
         self._cancel_ev = threading.Event()
         self._set_current_proc(None)
@@ -671,14 +436,15 @@ class App(tk.Tk):
 
     def _pack_done(self, ok: bool, msg: str, extra: str | None) -> None:
         self._busy = False
-        self.lbl_drop.configure(text="拖放文件/文件夹")
-        self.btn_cancel.configure(state=tk.DISABLED)
+        self._home_page.lbl_drop.configure(text="拖放文件/文件夹")
+        self._home_page.btn_cancel.configure(state=tk.DISABLED)
         self._cancel_ev = None
         self._set_current_proc(None)
         self._stop_job_timer()
 
         if ok:
             self._log_line(f"成功: {msg}")
+            self.logger.info('压缩成功: %s', msg)
             messagebox.showinfo("成功", msg)
             
             # 检查是否需要上传到百度网盘
@@ -686,51 +452,45 @@ class App(tk.Tk):
                 # 检查上传线程数限制
                 if self._upload_thread_count >= self._max_upload_threads:
                     self._log_line(f"上传线程数达到上限 ({self._max_upload_threads})，请稍后再试")
+                    self.logger.debug('上传线程数达到上限: %d/%d', self._upload_thread_count, self._max_upload_threads)
                 else:
                     self._log_line("开始上传到百度网盘...")
+                    self.logger.info('开始上传到百度网盘')
                     # 创建后台线程执行上传，不阻塞GUI
                     def upload_task():
-                        proc_id = None
+                        # 创建取消事件
+                        cancel_ev = threading.Event()
+                        # 保存进程引用
+                        current_proc = None
+                        
+                        def proc_cb(p):
+                            nonlocal current_proc
+                            current_proc = p
+                        
                         try:
                             # 增加上传线程计数
                             self._upload_thread_count += 1
                             self.after(0, self._log_line, f"当前上传线程数: {self._upload_thread_count}/{self._max_upload_threads}")
+                            self.logger.debug('上传线程启动: %d/%d', self._upload_thread_count, self._max_upload_threads)
                             
                             # 获取压缩产物路径
                             output_path = Path(msg)
                             
+                            # 取消回调函数
+                            def cancel_callback():
+                                if not cancel_ev.is_set():
+                                    cancel_ev.set()
+                                    self.after(0, self._log_line, f"取消上传任务: {output_path.name}")
+                                    self.logger.info('取消上传任务: %s', output_path.name)
+                            
+                            # 添加传输任务，传递取消回调
+                            self.after(0, lambda: self._transfer_page.add_transfer_task(output_path.name, cancel_callback))
+                            
                             # 检查路径是否存在
                             if not output_path.exists():
                                 self.after(0, self._log_line, f"上传失败: 产物路径不存在: {output_path}")
+                                self.logger.error('上传失败: 产物路径不存在: %s', output_path)
                                 return
-                            
-                            # 添加上传进程
-                            file_name = output_path.name
-                            # 直接调用，因为这是在后台线程中，需要通过线程安全的方式
-                            def add_proc():
-                                nonlocal proc_id
-                                proc_id = self._add_upload_process(file_name)
-                                # 刷新传输窗口
-                                if self._current_window == "transfer":
-                                    self._update_transfer_window()
-                            self.after(0, add_proc)
-                            
-                            # 等待进程添加完成
-                            import time
-                            time.sleep(0.1)
-                            
-                            # 获取取消事件
-                            cancel_ev = None
-                            def get_cancel_ev():
-                                nonlocal cancel_ev
-                                for p in self._upload_processes:
-                                    if p["id"] == proc_id:
-                                        cancel_ev = p["cancel_ev"]
-                                        break
-                            self.after(0, get_cancel_ev)
-                            
-                            # 等待获取取消事件
-                            time.sleep(0.1)
                             
                             # 调用上传模块
                             from auto_package.core.upload import upload_to_baidu_pan
@@ -739,52 +499,105 @@ class App(tk.Tk):
                             def log_callback(message):
                                 self.after(0, self._log_line, message)
                             
-                            ok, result_msg, proc = upload_to_baidu_pan(
+                            ok, result_msg = upload_to_baidu_pan(
                                 output_path=output_path,
-                                upload_base="/测试",
+                                upload_base=self._upload_path,
                                 log_cb=log_callback,
                                 cancel_ev=cancel_ev,
+                                proc_cb=proc_cb,
                             )
-                            
-                            # 存储进程对象
-                            def store_proc():
-                                for p in self._upload_processes:
-                                    if p["id"] == proc_id:
-                                        p["proc"] = proc
-                                        break
-                            self.after(0, store_proc)
                             if not ok:
                                 self.after(0, self._log_line, f"上传失败: {result_msg}")
+                                self.logger.error('上传失败: %s', result_msg)
                         except Exception as e:
                             self.after(0, self._log_line, f"上传异常: {e}")
+                            self.logger.error('上传异常: %s', e, exc_info=True)
                         finally:
                             # 减少上传线程计数
                             self._upload_thread_count -= 1
                             self.after(0, self._log_line, f"上传线程结束，当前上传线程数: {self._upload_thread_count}/{self._max_upload_threads}")
-                            # 移除上传进程
-                            if proc_id:
-                                def remove_proc():
-                                    self._remove_upload_process(proc_id)
-                                self.after(0, remove_proc)
+                            self.logger.debug('上传线程结束: %d/%d', self._upload_thread_count, self._max_upload_threads)
+                            # 移除传输任务
+                            self.after(0, lambda: self._transfer_page.remove_transfer_task(output_path.name))
                     
                     # 启动后台线程
                     import threading
                     threading.Thread(target=upload_task, daemon=True).start()
-        else:
-            self._log_line(f"失败: {msg}")
-            if extra:
-                self._log_line(f"中间文件: {extra}")
-            messagebox.showerror("失败", msg)
 
-        if self._close_after_cancel:
-            self.destroy()
+    def start_upload(self, output_path: Path):
+        """启动上传任务（供外部调用）"""
+        self.logger.info('外部调用上传: %s', output_path)
+        
+        def upload_task():
+            cancel_ev = threading.Event()
+            current_proc = None
+            
+            def proc_cb(p):
+                nonlocal current_proc
+                current_proc = p
+            
+            try:
+                self._upload_thread_count += 1
+                self.after(0, self._log_line, f"当前上传线程数: {self._upload_thread_count}/{self._max_upload_threads}")
+                self.logger.debug('上传线程启动: %d/%d', self._upload_thread_count, self._max_upload_threads)
+                
+                def cancel_callback():
+                    if not cancel_ev.is_set():
+                        cancel_ev.set()
+                        self.after(0, self._log_line, f"取消上传任务: {output_path.name}")
+                        self.logger.info('取消上传任务: %s', output_path.name)
+                
+                self.after(0, lambda: self._transfer_page.add_transfer_task(output_path.name, cancel_callback))
+                
+                if not output_path.exists():
+                    self.after(0, self._log_line, f"上传失败: 路径不存在: {output_path}")
+                    self.logger.error('上传失败: 路径不存在: %s', output_path)
+                    return
+                
+                from auto_package.core.upload import upload_to_baidu_pan
+                
+                def log_callback(message):
+                    self.after(0, self._log_line, message)
+                
+                ok, result_msg = upload_to_baidu_pan(
+                    output_path=output_path,
+                    upload_base=self._upload_path,
+                    log_cb=log_callback,
+                    cancel_ev=cancel_ev,
+                    proc_cb=proc_cb,
+                )
+                if not ok:
+                    self.after(0, self._log_line, f"上传失败: {result_msg}")
+                    self.logger.error('上传失败: %s', result_msg)
+                else:
+                    self.logger.info('上传成功: %s', output_path.name)
+            except Exception as e:
+                self.after(0, self._log_line, f"上传异常: {e}")
+                self.logger.error('上传异常: %s', e, exc_info=True)
+            finally:
+                self._upload_thread_count -= 1
+                self.after(0, self._log_line, f"上传线程结束，当前上传线程数: {self._upload_thread_count}/{self._max_upload_threads}")
+                self.logger.debug('上传线程结束: %d/%d', self._upload_thread_count, self._max_upload_threads)
+                self.after(0, lambda: self._transfer_page.remove_transfer_task(output_path.name))
+        
+        if self._upload_thread_count >= self._max_upload_threads:
+            self._log_line(f"上传线程数达到上限 ({self._max_upload_threads})，请稍后再试")
+            self.logger.debug('上传线程数达到上限: %d/%d', self._upload_thread_count, self._max_upload_threads)
+            return
+        
+        self._log_line("开始上传到百度网盘...")
+        self.logger.info('开始上传到百度网盘: %s', output_path.name)
+        import threading
+        threading.Thread(target=upload_task, daemon=True).start()
 
     def _on_drop_extract(self, paths: Iterable[bytes]) -> None:
         if self._extract_busy:
             self._log_line("正在解压，请稍候…")
+            self.logger.debug('用户尝试拖放文件，但当前正在解压')
             return
         if not self._winrar:
             messagebox.showerror("WinRAR", "未找到 WinRAR.exe，无法解压。")
+            self.logger.error('未找到 WinRAR.exe，无法解压')
             return
 
         decoded = [
@@ -793,22 +606,27 @@ class App(tk.Tk):
         items = [Path(p) for p in decoded if Path(p).exists()]
         if not items:
             messagebox.showinfo("提示", "请拖放文件。")
+            self.logger.debug('用户拖放了不存在的文件')
             return
         if len(items) > 1:
             messagebox.showinfo("提示", "一次只能解压一个文件。")
+            self.logger.debug('用户拖放了多个文件，只支持单个文件解压')
             return
+        self.logger.info('用户拖放解压文件: %s', items[0])
         self._start_extract(items[0])
 
     def _start_extract(self, input_path: Path) -> None:
         if not self._winrar:
             messagebox.showerror("WinRAR", "未找到 WinRAR.exe，无法解压。")
+            self.logger.error('未找到 WinRAR.exe，无法解压')
             return
 
         self._extract_busy = True
-        self.lbl_extract_drop.configure(text="正在解压…")
+        self._home_page.lbl_extract_drop.configure(text="正在解压…")
         self._log_line(f"开始解压: {input_path}")
+        self.logger.info('开始解压: %s', input_path)
         self._start_job_timer()
-        self.btn_cancel_extract.config(state=tk.NORMAL)
+        self._home_page.btn_cancel_extract.config(state=tk.NORMAL)
         self._extract_cancel_ev = threading.Event()
         self._extract_current_proc = None
         self._job_start_t = time.monotonic()
@@ -841,18 +659,22 @@ class App(tk.Tk):
     def _extract_done(self, ok: bool, msg: str, extra: str | None) -> None:
         """解压完成回调"""
         self._extract_busy = False
-        self.lbl_extract_drop.configure(text="拖放要解压的文件")
-        self.btn_cancel_extract.config(state=tk.DISABLED)
+        self._home_page.lbl_extract_drop.configure(text="拖放要解压的文件")
+        self._home_page.btn_cancel_extract.config(state=tk.DISABLED)
         self._extract_cancel_ev = None
         self._extract_current_proc = None
         self._stop_job_timer()
 
         if ok:
             self._log_line(f"解压成功: {msg}")
+            self.logger.info('解压成功: %s', msg)
         else:
             self._log_line(f"解压失败: {msg}")
+            self.logger.error('解压失败: %s', msg)
             if extra:
                 self._log_line(f"中间文件: {extra}")
+                self.logger.debug('中间文件: %s', extra)
 
         if self._close_after_cancel:
+            self.logger.info('解压取消后关闭程序')
             self.destroy()

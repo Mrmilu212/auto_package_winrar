@@ -8,6 +8,9 @@ import tempfile
 import subprocess
 import threading
 from auto_package.constants import _FAKE_EXTS, _EXECUTABLE_EXTS, _ARCHIVE_EXTS, _NAME_CHARS
+from auto_package.utils.logging_config import get_logger
+
+logger = get_logger()
 
 def decode_drop_path(raw: bytes) -> str:
     for enc in ("utf-8", "mbcs", "gbk"):
@@ -30,21 +33,27 @@ def _pick_nonexistent_path(parent: Path, suffix: str) -> Path:
     for _ in range(200):
         candidate = parent / f"{_random_archive_stem(5)}{suffix}"
         if not candidate.exists():
+            logger.debug('生成随机文件名: %s', candidate)
             return candidate
+    logger.error('无法生成不冲突的随机文件名（尝试次数过多）')
     raise RuntimeError("无法生成不冲突的随机文件名（尝试次数过多）")
 
 def _safe_unlink(p: Path) -> None:
     try:
         p.unlink()
+        logger.debug('删除文件: %s', p)
     except FileNotFoundError:
         return
-    except OSError:
+    except OSError as e:
+        logger.debug('删除文件失败: %s, 错误: %s', p, e)
         return
 
 def _safe_rmtree(d: Path) -> None:
     try:
         shutil.rmtree(d, ignore_errors=True)
-    except Exception:
+        logger.debug('删除目录: %s', d)
+    except Exception as e:
+        logger.debug('删除目录失败: %s, 错误: %s', d, e)
         pass
 
 def _collect_volume_parts(archive_path: Path) -> list[Path]:
@@ -122,7 +131,7 @@ def _count_non_archive_files(directory: Path) -> int:
 def _commit_outputs_atomic(
     temp_outputs: list[Path],
     target_dir: Path,
-    *, 
+    *,
     is_volumes: bool,
 ) -> tuple[bool, str, list[Path]]:
     """
@@ -137,18 +146,24 @@ def _commit_outputs_atomic(
     try:
         # 生成文件夹名
         # 对于分卷压缩，使用分卷文件的随机名作为文件夹名
-        # 对于普通压缩，使用随机生成的名称
+        # 对于普通压缩，使用压缩文件的文件名作为文件夹名
         if is_volumes and temp_outputs:
             # 从分卷文件中提取随机名（去掉 .part*.rar 后缀）
             import re
             part_pattern = r'\.part\d+\.rar$'
             first_file = temp_outputs[0].name
             folder_name = re.sub(part_pattern, '', first_file)
+        elif temp_outputs:
+            # 普通压缩，使用第一个压缩文件的文件名（去掉后缀）作为文件夹名
+            first_file = temp_outputs[0].name
+            folder_name = first_file.rsplit('.', 1)[0] if '.' in first_file else first_file
         else:
-            # 普通压缩，生成随机文件夹名
+            # 没有输出文件，生成随机文件夹名
             for _ in range(200):
                 folder_name = _random_archive_stem(5)
                 break
+        
+        logger.debug('生成文件夹名: %s', folder_name)
         
         # 确保文件夹名不冲突
         output_folder = target_dir / folder_name
@@ -158,12 +173,15 @@ def _commit_outputs_atomic(
             # 如果冲突，添加数字后缀
             output_folder = target_dir / f"{folder_name}_{i+1}"
         else:
+            logger.error('无法生成不冲突的文件夹名称')
             return False, "无法生成不冲突的文件夹名称", []
 
         # 创建文件夹
         try:
             output_folder.mkdir(exist_ok=False)
+            logger.debug('创建文件夹: %s', output_folder)
         except Exception as e:
+            logger.error('创建文件夹失败: %s, 错误: %s', output_folder, e)
             return False, f"创建文件夹失败: {e}", []
 
         # 移动所有产物到文件夹
@@ -171,8 +189,10 @@ def _commit_outputs_atomic(
             dst = output_folder / src.name
             shutil.move(str(src), str(dst))
             moved.append(dst)
+            logger.debug('移动文件: %s -> %s', src, dst)
 
         moved.sort()
+        logger.info('产物提交成功: %s', output_folder)
         return True, str(output_folder), moved
     except Exception as e:
         # rollback: delete anything moved
@@ -184,4 +204,5 @@ def _commit_outputs_atomic(
                 shutil.rmtree(output_folder, ignore_errors=True)
         except Exception:
             pass
+        logger.error('提交产物失败: %s', e)
         return False, f"提交产物失败: {e}", []
