@@ -1,8 +1,8 @@
-# auto_package_winrar
+# auto\_package\_winrar
 
 一个 Windows 图形界面工具：通过拖放文件/文件夹，自动调用 **WinRAR** 进行压缩或解压，支持多次压缩、伪装后缀、分卷压缩以及智能递归解压。
 
----
+***
 
 ## 功能概览
 
@@ -46,18 +46,19 @@
 - **上传路径管理**：自定义和管理百度网盘上传路径
 - **拖放上传**：在传输页面直接拖放文件夹上传
 
----
+***
 
 ## 环境要求
 
 - **操作系统**：Windows 10/11
+- BaiduPCS-Go：项目文件夹或系统环境变量中存在BaiduPCS-Go的可执行文件
 - **WinRAR**：已安装 WinRAR，且存在命令行工具
   - `Rar.exe`（用于压缩）
   - `WinRAR.exe`（用于解压，支持 rar/7z/zip）
   - 常见路径：`C:\Program Files\WinRAR\`
 - **Python**：Python 3.10+，并确保能使用 `pythonw.exe`（用于无控制台启动）
 
----
+***
 
 ## 安装
 
@@ -67,7 +68,7 @@
 python -m pip install -r requirements.txt
 ```
 
----
+***
 
 ## 启动
 
@@ -78,7 +79,7 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
----
+***
 
 ## 使用说明
 
@@ -98,12 +99,13 @@ python main.py
 3. 解压完成后，文件放在以最终内容目录名称命名的文件夹中
 
 **支持的格式**：
+
 - `.rar` - RAR 压缩包
 - `.7z` - 7-Zip 压缩包
 - `.zip` - ZIP 压缩包
 - 伪装后缀文件（自动尝试解压）
 
----
+***
 
 ## 界面说明
 
@@ -128,7 +130,7 @@ python main.py
 └─────────────────────────────────────────┘
 ```
 
----
+***
 
 ## 配置文件
 
@@ -136,7 +138,7 @@ python main.py
 
 - 窗口大小（`window_width`、`window_height`）
 
----
+***
 
 ## 常见问题
 
@@ -156,7 +158,7 @@ python main.py
 - 确认 WinRAR.exe 是否存在
 - 查看日志区域的错误信息
 
----
+***
 
 ## 技术说明
 
@@ -191,7 +193,7 @@ python main.py
 - 失败时自动清理临时文件
 - 使用 `finally` 块确保资源释放
 
----
+***
 
 ## 依赖
 
@@ -203,7 +205,7 @@ python main.py
 - `json` - 配置文件读写
 - `psutil` - 进程管理（用于上传任务取消）
 
----
+***
 
 ## 许可证
 
